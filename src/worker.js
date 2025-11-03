@@ -26,52 +26,7 @@ var worker_default = {
       return json(searchLinks());
     }
 
-    // front
-    if (url.pathname === "/") {
-  const html = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Boston Climate & Energy Events</title>
-      <script src="https://cdn.tailwindcss.com"></script>
-    </head>
-    <body class="bg-white text-gray-900">
-      <div class="max-w-3xl mx-auto p-6">
-        <h1 class="text-3xl font-bold mb-6 text-center">Boston Climate & Energy Events</h1>
-        <div id="events" class="space-y-4"></div>
-      </div>
-
-      <script>
-        async function loadEvents() {
-          const res = await fetch("/events.json");
-          const events = await res.json();
-          const upcoming = events
-            .filter(e => new Date(e.date_local) >= new Date())
-            .sort((a,b) => new Date(a.date_local) - new Date(b.date_local));
-          const container = document.getElementById("events");
-          for (const e of upcoming) {
-            const el = document.createElement("div");
-            el.className = "border border-gray-200 rounded-lg p-4 shadow-sm hover:shadow transition";
-            el.innerHTML = \`
-              <div class="text-sm text-gray-500">\${e.date_local} • \${e.time_local}</div>
-              <a href="\${e.link}" target="_blank" class="text-lg font-semibold text-blue-700 hover:underline">
-                \${e.title}
-              </a>
-              <div class="text-sm text-gray-600">\${e.venue}</div>
-              <div class="text-sm text-gray-500">\${e.address}</div>
-            \`;
-            container.appendChild(el);
-          }
-        }
-        loadEvents();
-      </script>
-    </body>
-    </html>`;
-  return new Response(html, { headers: { "content-type": "text/html" } });
-}
-// end front
+   
     return new Response("OK \xB7 /events.json /events.csv \xB7 POST /sources", { status: 200 });
   },
   async scheduled(event, env, ctx) {
