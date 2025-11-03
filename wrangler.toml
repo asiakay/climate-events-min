@@ -1,0 +1,6 @@
+name = "climate-events-min"
+main = "index.js"
+compatibility_date = "2025-11-03"
+
+[site]
+bucket = "./public"
