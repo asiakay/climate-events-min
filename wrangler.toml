@@ -1,5 +1,5 @@
 name = "climate-events-min"
-main = "index.js"
+main = "index.html"
 compatibility_date = "2025-11-03"
 
 [site]
