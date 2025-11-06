@@ -57,7 +57,39 @@ async function refresh(env) {
   const filtered = all.filter((e) => e.start && e.start >= now && e.start <= cutoff).filter(isClimate).map(enrichCity).sort((a, b) => a.start - b.start).map(toTemplateRow);
   const ttlH = Number(env.CACHE_TTL_HOURS || "12");
   await env.EVENTS_KV.put("events_json", JSON.stringify(filtered), { expirationTtl: ttlH * 3600 });
+  await syncEventsToD1(env, filtered);
   return filtered;
+
+
+async function syncEventsToD1(env, events) {
+  if (!env.DB) return;
+  for (const e of events) {
+    const id = crypto.randomUUID();
+    const tags = JSON.stringify(e.tags?.split(",").map(t => t.trim()).filter(Boolean));
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO events
+      (id, title, date, time, venue_name, address, city, organizer, link, source, tags)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      e.title || e.summary || "",
+      e.date_local,
+      e.time_local === "00:00" ? null : e.time_local,
+      e.venue || "",
+      e.address || "",
+      e.city || "",
+      e.host || "",
+      e.link || "",
+      e.source || "",
+      tags
+    ).run();
+  }
+}
+
+
+
+
+
 }
 __name(refresh, "refresh");
 async function getSources(env) {

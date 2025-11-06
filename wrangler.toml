@@ -4,3 +4,8 @@ compatibility_date = "2025-11-03"
 
 [site]
 bucket = "./public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "climate_events"
+database_id = "28642d7d-671f-43dd-91dc-11719b8e5521"
