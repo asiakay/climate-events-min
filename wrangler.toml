@@ -15,3 +15,7 @@ command = ""
 binding = "DB"
 database_name = "climate_events"
 database_id = "28642d7d-671f-43dd-91dc-11719b8e5521"
+
+[[kv_namespaces]]
+binding = "EVENTS_KV"
+id = "7ebd24071c2d4f8d91d6"
