@@ -1,159 +1,169 @@
-var __defProp = Object.defineProperty;
-var __name = (target, value) =>
-  __defProp(target, "name", { value, configurable: true });
-
-// main worker
-var worker_default = {
+export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Debug route
+    // 🔍 Debug binding check
     if (url.pathname === "/debug") {
-      return new Response(
-        JSON.stringify(Object.keys(env), null, 2),
-        { headers: { "content-type": "application/json" } }
-      );
+      return json(Object.keys(env));
     }
 
-    // Full events feed
+    // 📅 List all events
     if (url.pathname === "/events.json") {
       const data = await getEvents(env);
       return json(data);
     }
 
-    // CSV export
-    if (url.pathname === "/events.csv") {
-      const data = await getEvents(env);
-      return csvResponse(toCSV(data));
+    // 🏙️ Filter by city
+   if (url.pathname.startsWith("/city/") && url.pathname.endsWith(".json")) {
+  const city = decodeURIComponent(url.pathname.split("/city/")[1].replace(".json", "")).trim();
+  const stmt = env.DB.prepare(`
+    SELECT * FROM events
+    WHERE TRIM(LOWER(city)) = LOWER(?)
+    AND city != ''
+    ORDER BY date ASC
+  `);
+  const { results } = await stmt.bind(city).all();
+  return json(results);
+}
+    // 📥 Community event upload
+    if (url.pathname === "/api/events" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        if (!body.title || !body.city) {
+          return json({ error: "title and city are required" }, 400);
+        }
+
+        const id = crypto.randomUUID();
+        await env.DB.prepare(`
+          INSERT INTO events (
+            id, title, date, time, city, venue_name, address,
+            organizer, link, source, tags, image_url, description,
+            verified, source_type, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `).bind(
+          id,
+          body.title,
+          body.date || null,
+          body.time || null,
+          body.city,
+          body.venue_name || "",
+          body.address || "",
+          body.organizer || "",
+          body.link || "",
+          "community",
+          JSON.stringify(body.tags || []),
+          body.image_url || "",
+          body.description || "",
+          0, // verified
+          "community"
+        ).run();
+
+        // Clear cache so /events.json updates
+        await env.EVENTS_KV.delete("events_json");
+
+        return json({ ok: true, id });
+      } catch (err) {
+        return json({ error: err.message || "failed to insert" }, 500);
+      }
     }
 
-    // 🔥 City filter endpoint
-    if (url.pathname.startsWith("/city/")) {
-      const citySlug = url.pathname.split("/")[2]?.replace(".json", "").toLowerCase();
-      const data = await getEvents(env);
-      const filtered = data.filter(e =>
-        e.city && e.city.toLowerCase().replace(/\s+/g, "-") === citySlug
-      );
-      return json(filtered);
-    }
-
-    // POST new ICS sources
-    if (url.pathname === "/sources" && request.method === "POST") {
+    // 🔁 Admin route: refresh feeds manually
+    if (url.pathname === "/refresh" && request.method === "POST") {
       const auth = request.headers.get("x-api-key");
-      if (auth !== env.ADMIN_TOKEN)
-        return new Response("Unauthorized", { status: 401 });
-
-      const payload = await request.json().catch(() => ({}));
-      if (!Array.isArray(payload?.ics))
-        return new Response("Bad payload", { status: 400 });
-
-      await env.EVENTS_KV.put(
-        "ics_sources",
-        JSON.stringify(payload.ics),
-        { expirationTtl: 60 * 60 * 24 * 365 }
-      );
-      await env.EVENTS_KV.delete("events_json");
-      return json({ ok: true, count: payload.ics.length });
+      if (auth !== env.ADMIN_TOKEN) return new Response("Unauthorized", { status: 401 });
+      const refreshed = await refresh(env);
+      return json({ ok: true, count: refreshed.length });
     }
 
-    // Search links
-    if (url.pathname === "/search-links") {
-      return json(searchLinks());
-    }
-
-    return new Response("OK · /events.json /events.csv /city/{city}.json · POST /sources", {
-      status: 200,
-    });
+    return new Response("OK · /events.json · /city/{city}.json · POST /api/events · POST /refresh", { status: 200 });
   },
 
-  // Cron trigger to refresh cache
+  // ⏰ Cloudflare cron trigger
   async scheduled(event, env, ctx) {
     ctx.waitUntil(refresh(env));
   },
 };
 
-// Fetch events or refresh cache
+// ---------- Helper Functions ----------
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+// 🧠 Cached fetch from KV or refresh
 async function getEvents(env) {
   const cached = await env.EVENTS_KV.get("events_json", "json");
   if (cached) return cached;
-  return await refresh(env);
+  const refreshed = await refresh(env);
+  return refreshed;
 }
-__name(getEvents, "getEvents");
 
-// Refresh logic: pull from ICS, filter, save to KV + D1
+// 🔄 Refresh from ICS sources + sync to D1
 async function refresh(env) {
   const sources = await getSources(env);
   const all = [];
 
   for (const src of sources) {
     try {
-      const txt = await fetch(src).then((r) => (r.ok ? r.text() : ""));
+      const txt = await fetch(src).then(r => (r.ok ? r.text() : ""));
       if (!txt) continue;
-      const events = parseICS(txt).map((e) => ({ ...e, source: src }));
+      const events = parseICS(txt).map(e => ({ ...e, source: src }));
       all.push(...events);
-    } catch {
-      // ignore bad sources
+    } catch (e) {
+      console.log("⚠️ fetch error", e);
     }
   }
 
   const now = new Date();
-  const days = Number(env.DAYS_AHEAD || "30");
-  const cutoff = new Date(now.getTime() + days * 24 * 60 * 60 * 1e3);
-
+  const cutoff = new Date(now.getTime() + 30 * 86400 * 1000);
   const filtered = all
-    .filter((e) => e.start && e.start >= now && e.start <= cutoff)
+    .filter(e => e.start && e.start >= now && e.start <= cutoff)
     .filter(isClimate)
     .map(enrichCity)
     .sort((a, b) => a.start - b.start)
     .map(toTemplateRow);
 
-  const ttlH = Number(env.CACHE_TTL_HOURS || "12");
-  await env.EVENTS_KV.put("events_json", JSON.stringify(filtered), {
-    expirationTtl: ttlH * 3600,
-  });
-
+  await env.EVENTS_KV.put("events_json", JSON.stringify(filtered), { expirationTtl: 12 * 3600 });
   await syncEventsToD1(env, filtered);
+
   return filtered;
 }
-__name(refresh, "refresh");
 
-// Sync to D1 database
+// 🗂️ Write parsed events into D1
 async function syncEventsToD1(env, events) {
   if (!env.DB) return;
   for (const e of events) {
     const id = crypto.randomUUID();
-    const tags = JSON.stringify(
-      e.tags?.split(",").map((t) => t.trim()).filter(Boolean)
-    );
-    await env.DB.prepare(
-      `
+    const tags = JSON.stringify(e.tags?.split(",").map(t => t.trim()).filter(Boolean));
+    await env.DB.prepare(`
       INSERT OR REPLACE INTO events
-      (id, title, date, time, venue_name, address, city, organizer, link, source, tags)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `
-    )
-      .bind(
-        id,
-        e.title || e.summary || "",
-        e.date_local,
-        e.time_local === "00:00" ? null : e.time_local,
-        e.venue || "",
-        e.address || "",
-        e.city || "",
-        e.host || "",
-        e.link || "",
-        e.source || "",
-        tags
-      )
-      .run();
+      (id, title, date, time, city, venue_name, address, organizer, link, source, tags, source_type, verified, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).bind(
+      id,
+      e.title || e.summary || "",
+      e.date_local,
+      e.time_local === "00:00" ? null : e.time_local,
+      e.city || "",
+      e.venue || "",
+      e.address || "",
+      e.host || "",
+      e.link || "",
+      e.source || "",
+      tags,
+      "feed",
+      1 // verified
+    ).run();
   }
 }
-__name(syncEventsToD1, "syncEventsToD1");
 
-// ICS source list (fallback)
+// ---------- ICS Parsing + Helpers ----------
 async function getSources(env) {
-  const fromKv = await env.EVENTS_KV.get("ics_sources", "json");
-  if (Array.isArray(fromKv) && fromKv.length) return fromKv;
+  const kv = await env.EVENTS_KV.get("ics_sources", "json");
+  if (Array.isArray(kv) && kv.length) return kv;
   return [
     "https://link.climatetechlist.com/boston-climate-tech-ical-feed",
     "https://www.architects.org/events/subscribe.ics",
@@ -161,155 +171,18 @@ async function getSources(env) {
     "https://www.mapc.org/calendar/?ical=1",
   ];
 }
-__name(getSources, "getSources");
-
-// Helpers
-function json(obj) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-}
-__name(json, "json");
-
-function csvResponse(text) {
-  return new Response(text, {
-    headers: {
-      "content-type": "text/csv; charset=utf-8",
-      "content-disposition": 'attachment; filename="climate-events.csv"',
-    },
-  });
-}
-__name(csvResponse, "csvResponse");
-
-function toCSV(rows) {
-  const header = [
-    "date_local",
-    "time_local",
-    "city",
-    "title",
-    "host",
-    "venue",
-    "address",
-    "link",
-    "source",
-    "tags",
-  ];
-  if (!rows?.length) return header.join(",") + "\n";
-  const esc = (v) => {
-    const s = v == null ? "" : String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  return [
-    header.join(","),
-    ...rows.map((r) => header.map((k) => esc(r[k])).join(",")),
-  ].join("\n");
-}
-__name(toCSV, "toCSV");
-
-function isClimate(e) {
-  const text = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
-  const tags = [
-    "climate",
-    "cleantech",
-    "clean tech",
-    "energy",
-    "decarbon",
-    "net zero",
-    "sustainab",
-    "green",
-    "circular",
-    "esg",
-    "grid",
-    "heat pump",
-    "solar",
-    "ev",
-    "microgrid",
-    "carbon",
-    "resilience",
-  ];
-  return tags.some((t) => text.includes(t));
-}
-__name(isClimate, "isClimate");
-
-function enrichCity(e) {
-  const blob = `${e.location || ""} ${e.description || ""} ${
-    e.summary || ""
-  }`.toLowerCase();
-  let city = e.city || "";
-  if (!city) {
-    if (/\bboston\b/.test(blob) || /\bma(ssachusetts)?\b/.test(blob))
-      city = "Boston";
-    if (
-      !city &&
-      (/\bnew york\b/.test(blob) || /\bnyc\b/.test(blob) || /\bny\b/.test(blob))
-    )
-      city = "New York";
-  }
-  return { ...e, city };
-}
-__name(enrichCity, "enrichCity");
-
-function toTemplateRow(e) {
-  const d = e.start;
-  const date_local = d
-    ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
-        2,
-        "0"
-      )}-${String(d.getDate()).padStart(2, "0")}`
-    : "";
-  const time_local = d
-    ? `${String(d.getHours()).padStart(2, "0")}:${String(
-        d.getMinutes()
-      ).padStart(2, "0")}`
-    : "";
-  const host = (() => {
-    try {
-      return e.source ? new URL(e.source).hostname.replace(/^www\./, "") : "";
-    } catch {
-      return "";
-    }
-  })();
-  const text = `${e.summary ?? ""} ${e.description ?? ""}`.toLowerCase();
-  const tagMap = [
-    ["climate tech", /climate|cleantech|clean tech/],
-    ["energy", /energy|grid|utility|solar|ev|microgrid|battery/],
-    ["decarbonization", /decarbon|net ?zero|carbon/],
-    ["sustainability", /sustainab|circular|esg|green/],
-    ["policy", /policy|regulat/],
-    ["career", /career|jobs|hiring|recruit/],
-    ["founders", /startup|pitch|demo|accelerator|incubator/],
-  ];
-  const tags = tagMap
-    .filter(([, rx]) => rx.test(text))
-    .map(([t]) => t)
-    .join(",");
-  return {
-    date_local,
-    time_local,
-    city: e.city || "",
-    title: e.summary || "",
-    host,
-    venue: e.venue || "",
-    address: e.address || "",
-    link: e.url || e.source || "",
-    source: e.source || "",
-    tags,
-  };
-}
-__name(toTemplateRow, "toTemplateRow");
 
 function parseICS(text) {
   const unfolded = text.replace(/\r?\n[ \t]/g, "");
   const events = [];
-  const blocks = unfolded.split("BEGIN:VEVENT").slice(1);
-  for (const blk of blocks) {
-    const seg = blk.split("END:VEVENT")[0];
+  for (const chunk of unfolded.split("BEGIN:VEVENT").slice(1)) {
+    const seg = chunk.split("END:VEVENT")[0];
     const obj = {};
     for (const line of seg.split(/\r?\n/)) {
       if (!line.trim()) continue;
-      const [rawKey, ...rest] = line.split(":");
+      const [keyRaw, ...rest] = line.split(":");
+      const key = keyRaw.toUpperCase();
       const value = rest.join(":");
-      const key = rawKey.toUpperCase();
       if (key.startsWith("SUMMARY")) obj.summary = value;
       else if (key.startsWith("DESCRIPTION")) obj.description = value;
       else if (key.startsWith("LOCATION")) {
@@ -320,44 +193,39 @@ function parseICS(text) {
           obj.address = parts[1].trim();
         }
       } else if (key.startsWith("URL")) obj.url = value;
-      else if (key.startsWith("DTSTART")) obj.start = parseIcsDate(rawKey, value);
-      else if (key.startsWith("DTEND")) obj.end = parseIcsDate(rawKey, value);
+      else if (key.startsWith("DTSTART")) obj.start = parseIcsDate(value);
     }
     events.push(obj);
   }
   return events;
 }
-__name(parseICS, "parseICS");
 
-function parseIcsDate(keyLine, value) {
-  if (/^\d{8}$/.test(value))
-    return new Date(
-      `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(
-        6,
-        8
-      )}T00:00:00`
-    );
-  if (/^\d{8}T\d{6}Z$/.test(value)) return new Date(value);
-  const iso = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(
-    6,
-    8
-  )}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}`;
-  return new Date(iso);
+function parseIcsDate(v) {
+  if (/^\d{8}$/.test(v)) return new Date(`${v.slice(0, 4)}-${v.slice(4, 6)}-${v.slice(6, 8)}T00:00:00`);
+  if (/^\d{8}T\d{6}Z$/.test(v)) return new Date(v);
+  return new Date();
 }
-__name(parseIcsDate, "parseIcsDate");
 
-function searchLinks() {
-  return [
-    {
-      city: "Boston, MA",
-      meetup:
-        "https://www.meetup.com/find/?keywords=climate%20tech%2Ccleantech%2Cdecarbonization&source=EVENTS&location=Boston%2C%20MA",
-      eventbrite:
-        "https://www.eventbrite.com/d/boston--ma/--next-month/all-events/?q=climate%20tech%20cleantech%20decarbonization",
-      luma: "https://lu.ma/discover?search=climate%20tech&location=Boston",
-    },
-  ];
+function isClimate(e) {
+  const t = `${e.summary || ""} ${e.description || ""}`.toLowerCase();
+  return ["climate", "energy", "decarbon", "solar", "green", "cleantech"].some(x => t.includes(x));
 }
-__name(searchLinks, "searchLinks");
 
-export { worker_default as default };
+function enrichCity(e) {
+  const blob = `${e.location || ""} ${e.description || ""} ${e.summary || ""}`.toLowerCase();
+  let city = e.city || "";
+  if (!city) {
+    if (/\bboston\b/.test(blob)) city = "Boston";
+    if (!city && /\bnew york\b/.test(blob)) city = "New York";
+  }
+  return { ...e, city };
+}
+
+function toTemplateRow(e) {
+  const d = e.start;
+  const date_local = d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "";
+  const time_local = d ? `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}` : "";
+  const host = e.source ? new URL(e.source).hostname.replace(/^www\./, "") : "";
+  const tags = ["climate tech", "energy", "policy", "career", "founders"].filter(t => (e.summary + e.description).toLowerCase().includes(t.split(" ")[0])).join(",");
+  return { date_local, time_local, city: e.city || "", title: e.summary || "", host, venue: e.venue || "", address: e.address || "", link: e.url || "", source: e.source || "", tags };
+}
