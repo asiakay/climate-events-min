@@ -2,8 +2,8 @@ name = "climate-events-min"
 main = "api/_worker.js"
 compatibility_date = "2025-11-06"
 
-
-
+[triggers]
+crons = ["0 */12 * * *"]  # every 12 hours
 
 
 # [site]
