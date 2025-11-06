@@ -1,9 +1,15 @@
 name = "climate-events-min"
-main = "site/public/index.html"
-compatibility_date = "2025-11-03"
+main = "api/_worker.js"
+compatibility_date = "2025-11-06"
 
-[site]
-bucket = "./public"
+[build]
+upload.format = "modules"
+command = ""
+
+
+
+# [site]
+# bucket = "./public"
 
 [[d1_databases]]
 binding = "DB"
